@@ -20,8 +20,11 @@ from tabdl.utils import read_jsonl, slug  # noqa: E402
 
 BASELINES = ["logreg", "knn", "rf", "xgb", "lgbm", "catboost"]
 REPRO_METHODS = BASELINES + ["tabpfn_v2"]
-EXISTING = ["tabpfn_v2", "catboost", "tabpfn_v2_ft", "ens_pfn_cat", "ens_ft_cat"]
-OURS = ["tabpfn_te", "tabpfn_gbx", "tabpfn_gbx_te", "ens_gbx", "ens_gbx_ft"]
+EXISTING = ["tabpfn_v2", "catboost", "tabpfn_v2_ft", "ens_pfn_cat", "ens_ft_cat", "ens_phe"]
+OURS = ["tabpfn_te", "tabpfn_gbx", "tabpfn_gbx_te", "ens_gbx", "ens_gbx_phe", "ens_gbx_phe_ft"]
+PORTFOLIO = ["tabpfn_v2", "pfn_onehot", "pfn_ordinal", "pfn_kdi", "pfn_poly", "pfn_sharp",
+             "pfn_avgsm", "pfn_wide", "tabpfn_gbx_te", "gbx_onehot"]
+FINAL = "ens_gbx_phe"
 NICE = {
     "logreg": "Logistic Regression", "knn": "kNN", "rf": "Random Forest",
     "xgb": "XGBoost", "lgbm": "LightGBM", "catboost": "CatBoost",
@@ -33,7 +36,13 @@ NICE = {
     "tabpfn_gbx": "TabPFN v2 + OOF-GBDT logits [ours, ablation]",
     "tabpfn_gbx_te": "TabPFN-GBX [ours]",
     "ens_gbx": "TabPFN-GBX-Ens [ours]",
-    "ens_gbx_ft": "TabPFN-GBX-Ens + FT [ours, full]",
+    "ens_phe": "TabPFN v2-PHE (config ensemble) [existing idea]",
+    "ens_gbx_phe": "TabPFN-GBX-PHE [ours, final]",
+    "ens_gbx_phe_ft": "TabPFN-GBX-PHE + FT [ours, final+FT]",
+    "pfn_onehot": "TabPFN v2 cfg: one-hot categoricals", "pfn_ordinal": "TabPFN v2 cfg: ordinal",
+    "pfn_kdi": "TabPFN v2 cfg: KDI transform", "pfn_poly": "TabPFN v2 cfg: +polynomial",
+    "pfn_sharp": "TabPFN v2 cfg: T=0.75", "pfn_avgsm": "TabPFN v2 cfg: avg logits",
+    "pfn_wide": "TabPFN v2 cfg: 32 estimators", "gbx_onehot": "TabPFN-GBX cfg: one-hot",
 }
 METRICS = ["roc_auc", "accuracy", "log_loss"]
 
@@ -118,9 +127,12 @@ def method_times(df):
     for ens, mem in [("ens_pfn_cat", ["tabpfn_v2", "catboost"]),
                      ("ens_ft_cat", ["tabpfn_v2_ft", "catboost"]),
                      ("ens_gbx", ["tabpfn_v2", "tabpfn_gbx_te", "catboost"]),
-                     ("ens_gbx_ft", ["tabpfn_v2", "tabpfn_gbx_te", "tabpfn_v2_ft", "catboost"])]:
-        if all(m in t.index for m in mem):
-            t[ens] = 2 * sum(t[m] for m in mem)
+                     ("ens_phe", PORTFOLIO[:8]),
+                     ("ens_gbx_phe", PORTFOLIO + ["catboost"]),
+                     ("ens_gbx_phe_ft", PORTFOLIO + ["catboost", "tabpfn_v2_ft"])]:
+        avail = [m for m in mem if m in t.index]
+        if len(avail) >= 2:
+            t[ens] = 2 * sum(t[m] for m in avail)
     return t
 
 
@@ -289,15 +301,21 @@ def main():
             sg.to_csv(os.path.join(a.out, "table_B_subgroups.csv"), index=False)
             md += ["Mean ΔAUC vs. TabPFN v2 by subset:\n",
                    sg.to_markdown(index=False, floatfmt="+.4f") + "\n"]
-            ours = "tabpfn_gbx_te" if "tabpfn_gbx_te" in piv else None
+            ours = next((m for m in [FINAL, "tabpfn_gbx_te"] if m in piv), None)
             if ours:
                 y = piv[ours] - piv["tabpfn_v2"]
                 plot_scatter(gap.values, y.values, "AUC(TabPFN v2) − AUC(best baseline)",
                              f"AUC({nice(ours)}) − AUC(TabPFN v2)",
-                             "Gain of TabPFN-GBX vs. weakness of TabPFN v2",
+                             f"Gain of {nice(ours)} vs. weakness of TabPFN v2",
                              os.path.join(a.out, "fig_B_gain_vs_weakness.png"),
                              labels=list(piv.index))
                 md.append("![gain](fig_B_gain_vs_weakness.png)\n")
+        # -------- individual portfolio members -------- #
+        port = coverage_filter(pdf, [m for m in PORTFOLIO if m in present])
+        if len(port) > 2:
+            tp, _ = summary_table(pdf, port, "tabpfn_v2", times)
+            tp.to_csv(os.path.join(a.out, "table_B_portfolio_members.csv"), index=False)
+            md += ["Single members of the post-hoc ensemble portfolio:\n", fmt(tp) + "\n"]
         if "weights" in df.columns:
             w = df[df["method"].str.startswith("ens_") & df["weights"].notna()]
             if len(w):

@@ -1,12 +1,13 @@
-# TabPFN v2 — Reproduce & cải tiến: **TabPFN-GBX** (đồ án môn Deep Learning)
+# TabPFN v2 — Reproduce & cải tiến: **TabPFN-GBX-PHE** (đồ án môn Deep Learning)
 
 * **Paper gốc:** Hollmann et al., *Accurate predictions on small data with a tabular foundation
   model*, **Nature 637, 2025** (TabPFN v2).
 * **Phần A – Reproduce:** TabPFN v2 dùng ngay (không tune) tốt hơn các mô hình cổ điển cấu hình
   mặc định trên dữ liệu bảng nhỏ (OpenML-CC18).
-* **Phần B – Cải tiến:** **TabPFN-GBX**, làm giàu ngữ cảnh của TabPFN v2 bằng thông tin GBDT
-  được cross-fit, nhắm đúng vào điểm yếu của TabPFN v2 (dữ liệu nhiều biến phân loại, nơi mô hình
-  cây thắng). Không fine-tune, không pretrain lại, chạy trên Kaggle T4.
+* **Phần B – Cải tiến:** **TabPFN-GBX-PHE** = (1) TabPFN-GBX: làm giàu ngữ cảnh của TabPFN v2 bằng
+  thông tin GBDT được cross-fit, nhắm vào điểm yếu với dữ liệu nhiều biến phân loại; (2) portfolio
+  cấu hình tiền xử lý của cùng checkpoint TabPFN v2; (3) post-hoc ensemble selection trên toàn bộ
+  portfolio và CatBoost. Không fine-tune, không pretrain lại, chạy trên Kaggle T4.
 
 ---
 
@@ -34,10 +35,16 @@ cross-fitting K-fold trên tập train:
   `tests/test_smoke.py` kiểm tra điều này bằng nhãn ngẫu nhiên (AUC phải ở mức ngẫu nhiên).
 * Dòng test nhận **trung bình dự đoán của K mô hình fold**, cùng phân phối với giá trị OOF.
 * TabPFN tự quyết định trong ngữ cảnh khi nào tin GBDT, khi nào tin đặc trưng gốc.
-* **TabPFN-GBX-Ens:** ensemble selection (Caruana 2004) giữa TabPFN v2, TabPFN-GBX và CatBoost,
-  trọng số chọn trên validation nội bộ (80/20 trong fold train, không dùng tập test).
+* **Portfolio cấu hình TabPFN v2** (cùng checkpoint, chỉ đổi suy luận): one-hot hoặc ordinal cho
+  biến phân loại, biến đổi KDI, thêm 50 đặc trưng đa thức, nhiệt độ softmax 0.75, trung bình logits,
+  32 estimator; và TabPFN-GBX với one-hot. Paper Nature cũng báo cáo post-hoc ensembling (PHE) các
+  cấu hình TabPFN v2 giúp cải thiện so với mặc định.
+* **TabPFN-GBX-PHE (bản chính):** ensemble selection (Caruana 2004) trên toàn bộ portfolio +
+  TabPFN-GBX + CatBoost, trọng số chọn trên validation nội bộ (80/20 trong fold train, không dùng
+  tập test). So với **TabPFN v2-PHE** (chỉ portfolio TabPFN) để tách riêng đóng góp của GBX.
 
-Chi phí: K lần fit CatBoost trên CPU và một lượt forward của TabPFN; không cần gradient.
+Chi phí: K lần fit CatBoost trên CPU và khoảng 10 lượt suy luận TabPFN (chậm hơn bản gốc vài lần);
+không cần gradient.
 
 ## 2. Thiết kế thực nghiệm
 
@@ -50,8 +57,8 @@ Chi phí: K lần fit CatBoost trên CPU và một lượt forward của TabPFN;
 |---|---|
 | Bản gốc | TabPFN v2 (checkpoint của paper Nature, 8 estimator) |
 | Baseline cổ điển | Logistic Regression, kNN, Random Forest, XGBoost, LightGBM, CatBoost |
-| Cải tiến đã có | TabPFN v2 + fine-tune (module chính thức `tabpfn.finetuning`, Rubachev et al. 2025); Ens(TabPFN v2, CatBoost); Ens(TabPFN v2-FT, CatBoost) |
-| **Của ta** | **TabPFN-GBX**, **TabPFN-GBX-Ens**; ablation: chỉ OOF-TE, chỉ OOF-GBDT |
+| Cải tiến đã có | TabPFN v2 + fine-tune (module chính thức `tabpfn.finetuning`, Rubachev et al. 2025); Ens(TabPFN v2, CatBoost); Ens(TabPFN v2-FT, CatBoost); TabPFN v2-PHE (ensemble cấu hình) |
+| **Của ta** | **TabPFN-GBX-PHE** (bản chính), +FT; TabPFN-GBX, TabPFN-GBX-Ens; ablation: chỉ OOF-TE, chỉ OOF-GBDT, từng cấu hình portfolio |
 
 * **Metric:** ROC-AUC (chính), accuracy, log-loss, mean rank, win/tie/loss, Wilcoxon signed-rank.
 * **Phân tích:** mức cải thiện theo nhóm dataset (TabPFN v2 đang thua / đang thắng; có / không có
@@ -63,7 +70,7 @@ Chi phí: K lần fit CatBoost trên CPU và một lượt forward của TabPFN;
 2. Kaggle: **Accelerator = GPU T4 x2**, **Internet = On**.
 3. **Session 1:** `notebooks/01_reproduce_tabpfn_v2.ipynb`. Sửa `REPO_URL`, chạy hết, tải
    `session1_results.zip`.
-4. **Session 2:** `notebooks/02_improve_tabpfn_gbx.ipynb`. Upload `session1_results.zip` thành
+4. **Session 2:** `notebooks/02_improve_tabpfn_gbx_phe.ipynb`. Upload `session1_results.zip` thành
    Kaggle Dataset, gắn vào notebook, sửa `REPO_URL`, chạy hết, tải `final_results.zip`.
 
 Mọi script chạy tiếp được: chạy lại cell sẽ bỏ qua phần đã xong.
@@ -71,21 +78,21 @@ Mọi script chạy tiếp được: chạy lại cell sẽ bỏ qua phần đã
 | Bước | Thời gian ước tính trên Kaggle |
 |---|---|
 | Notebook 1 (Phần A) | ~1–1,5 giờ |
-| Notebook 2: TabPFN-GBX (GPU 0) song song fine-tune baseline (GPU 1) | ~3–4 giờ |
+| Notebook 2: GBX + portfolio (GPU 0) song song fine-tune baseline (GPU 1) | ~3–4 giờ |
 | Ensemble + báo cáo | vài phút |
 
-Giảm thời gian: `FT_TIME = 30` hoặc `GBX_FOLDS = 4` trong Notebook 2.
+Giảm thời gian: `FT_TIME = 30` hoặc `GBX_FOLDS = 4` trong Notebook 2, hoặc bỏ `pfn_wide` khỏi danh sách.
 
 ## 4. Cấu trúc repo
 ```
 tabpfn-dl-project/
 ├── notebooks/01_reproduce_tabpfn_v2.ipynb   # Session 1
-├── notebooks/02_improve_tabpfn_gbx.ipynb    # Session 2
+├── notebooks/02_improve_tabpfn_gbx_phe.ipynb  # Session 2
 ├── scripts/run_benchmark.py   # chạy mọi phương pháp, lưu metric + dự đoán, resumable
 ├── scripts/run_ensembles.py   # ensemble selection từ dự đoán đã lưu
 ├── scripts/make_report.py     # bảng Markdown/CSV + hình PNG
 ├── src/tabdl/augment.py       # TabPFN-GBX: OOF target encoding, OOF CatBoost logits
-├── src/tabdl/models.py        # baselines, TabPFN v2, TabPFN v2-FT, các biến thể GBX
+├── src/tabdl/models.py        # baselines, TabPFN v2, TabPFN v2-FT, portfolio cấu hình, biến thể GBX
 ├── src/tabdl/data.py          # OpenML-CC18 + fallback sklearn, chia fold
 ├── src/tabdl/ensemble.py, metrics.py, utils.py
 └── tests/test_smoke.py        # kiểm thử nhanh, gồm kiểm tra không rò rỉ nhãn
@@ -97,7 +104,7 @@ Chạy local: `pip install -r requirements.txt && python tests/test_smoke.py`, s
 
 ## 5. Đầu ra (`results/report/`)
 * `table_A_reproduction.csv`, `table_A_weakness_gap.csv`, `fig_A_rank.png`
-* `table_B_improvement.csv`, `table_B_deltas.csv`, `table_B_subgroups.csv`,
+* `table_B_improvement.csv`, `table_B_deltas.csv`, `table_B_subgroups.csv`, `table_B_portfolio_members.csv`,
   `table_B_ensemble_weights.csv`, `fig_B_delta_auc.png`, `fig_B_delta_logloss.png`,
   `fig_B_gain_vs_weakness.png`
 * `report.md` tổng hợp toàn bộ
@@ -105,7 +112,8 @@ Chạy local: `pip install -r requirements.txt && python tests/test_smoke.py`, s
 ## 6. Giới hạn cần nêu trong báo cáo
 * Baseline dùng tham số mặc định (paper còn so với baseline tune 4 giờ); 3 fold thay vì 10 lần lặp;
   dataset ≤ 3000 dòng để vừa ngân sách T4.
-* TabPFN-GBX tốn thêm thời gian CPU cho K lần fit CatBoost so với TabPFN v2 gốc.
+* TabPFN-GBX-PHE tốn thêm thời gian (K lần fit CatBoost + ~10 lượt suy luận TabPFN, mỗi mô hình
+  fit hai lần cho validation nội bộ) so với TabPFN v2 gốc; báo cáo có cột thời gian để so sánh.
 * Kết luận chỉ dựa trên các con số chạy được ở Notebook 2. Báo cáo đúng kết quả, kể cả khi một
   thành phần (ví dụ OOF-TE) không giúp.
 

@@ -110,13 +110,16 @@ def _v2_model_path(ckpt: str):
 
 
 class TabPFNv2Wrapper:
-    def __init__(self, cat_idx, seed, n_estimators=8, ckpt="original", device=None):
+    def __init__(self, cat_idx, seed, n_estimators=8, ckpt="original", device=None,
+                 inference_config=None, **extra):
         from tabpfn import TabPFNClassifier
         from tabpfn.constants import ModelVersion
         kw = dict(n_estimators=n_estimators, random_state=seed,
                   device=device or ("cuda" if has_cuda() else "cpu"),
                   categorical_features_indices=list(cat_idx) or None,
-                  ignore_pretraining_limits=True)
+                  ignore_pretraining_limits=True, **extra)
+        if inference_config:
+            kw["inference_config"] = inference_config
         mp = _v2_model_path(ckpt)
         if mp is not None:
             kw["model_path"] = mp
@@ -169,8 +172,64 @@ class FinetunedTabPFNv2Wrapper:
 
 
 # --------------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
+# Portfolio of TabPFN v2 inference configurations for post-hoc ensembling (PHE).
+# The Nature paper reports that post-hoc ensembling of TabPFN v2 configurations
+# ("TabPFN (PHE)") improves over the default; here each member changes the
+# preprocessing / decoding of the *same frozen* checkpoint.
+# --------------------------------------------------------------------------- #
+def _pc(name, cat, **kw):
+    from tabpfn.preprocessing.configs import PreprocessorConfig
+    kw.setdefault("max_features_per_estimator", 10_000)   # same as the v2 default
+    return PreprocessorConfig(name, categorical_name=cat, **kw)
+
+
+def pfn_portfolio_config(name: str) -> dict:
+    """Return TabPFNv2Wrapper kwargs for a portfolio member."""
+    if name == "pfn_onehot":        # one-hot categoricals (targets the categorical weakness)
+        return dict(inference_config={"PREPROCESS_TRANSFORMS": [
+            _pc("quantile_uni_coarse", "onehot", append_original="auto",
+                global_transformer_name="svd", max_onehot_cardinality=12),
+            _pc("none", "onehot", max_onehot_cardinality=12)]})
+    if name == "pfn_ordinal":       # sorted / shuffled ordinal codes + other scalers
+        return dict(inference_config={"PREPROCESS_TRANSFORMS": [
+            _pc("quantile_norm", "ordinal_shuffled", append_original="auto"),
+            _pc("safepower", "ordinal")]})
+    if name == "pfn_kdi":           # kernel-density-integral transforms
+        return dict(inference_config={"PREPROCESS_TRANSFORMS": [
+            _pc("kdi_alpha_1.0_uni", "numeric", append_original=True),
+            _pc("robust", "numeric")]})
+    if name == "pfn_poly":          # + 50 pairwise product features
+        return dict(inference_config={"POLYNOMIAL_FEATURES": 50})
+    if name == "pfn_sharp":         # lower softmax temperature
+        return dict(softmax_temperature=0.75)
+    if name == "pfn_avgsm":         # average logits instead of probabilities
+        return dict(average_before_softmax=True)
+    if name == "pfn_wide":          # 4x more ensemble members
+        return dict(n_estimators=32)
+    raise ValueError(name)
+
+
+PFN_PORTFOLIO = ["pfn_onehot", "pfn_ordinal", "pfn_kdi", "pfn_poly", "pfn_sharp",
+                 "pfn_avgsm", "pfn_wide"]
+
+
 def make_model(name: str, cat_idx, seed: int, n_classes: int, cfg: dict | None = None):
     cfg = cfg or {}
+    if name in PFN_PORTFOLIO:
+        kw = dict(n_estimators=cfg.get("n_estimators", 8), ckpt=cfg.get("ckpt", "original"))
+        kw.update(pfn_portfolio_config(name))
+        return TabPFNv2Wrapper(cat_idx, seed, **kw)
+    if name == "gbx_onehot":        # TabPFN-GBX on top of the one-hot configuration
+        from .augment import AugmentedICL
+
+        def factory(ci):
+            kw = dict(n_estimators=cfg.get("n_estimators", 8), ckpt=cfg.get("ckpt", "original"))
+            kw.update(pfn_portfolio_config("pfn_onehot"))
+            return TabPFNv2Wrapper(ci, seed, **kw)
+        return AugmentedICL(factory, cat_idx, n_classes, use_te=True, use_gbx=True,
+                            n_folds=cfg.get("gbx_folds", 5),
+                            gbdt_iterations=cfg.get("gbx_iterations", 500), seed=seed)
     if name == "tabpfn_v2":
         return TabPFNv2Wrapper(cat_idx, seed, n_estimators=cfg.get("n_estimators", 8),
                                ckpt=cfg.get("ckpt", "original"))

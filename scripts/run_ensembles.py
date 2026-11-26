@@ -20,16 +20,25 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 
 from tabdl.ensemble import blend, caruana_weights  # noqa: E402
 from tabdl.metrics import all_metrics  # noqa: E402
+from tabdl.models import PFN_PORTFOLIO  # noqa: E402
 from tabdl.utils import append_jsonl, read_jsonl  # noqa: E402
 
+# A trailing "?" marks an optional member: it is used when its predictions exist
+# for that fold (e.g. a portfolio configuration that failed on one dataset is
+# simply skipped instead of dropping the whole ensemble).
+_PHE = "+".join(["tabpfn_v2"] + [m + "?" for m in PFN_PORTFOLIO])
 DEFAULT_SPECS = [
     # existing practice: blend TabPFN v2 (or its fine-tuned version) with CatBoost
     "ens_pfn_cat=tabpfn_v2+catboost",
     "ens_ft_cat=tabpfn_v2_ft+catboost",
+    # post-hoc ensemble of TabPFN v2 configurations (PHE, the idea of the Nature paper)
+    f"ens_phe={_PHE}",
     # ours: TabPFN-GBX + plain TabPFN v2 + CatBoost
     "ens_gbx=tabpfn_v2+tabpfn_gbx_te+catboost",
-    # ours (full portfolio): also lets the selector use the fine-tuned TabPFN v2
-    "ens_gbx_ft=tabpfn_v2+tabpfn_gbx_te+tabpfn_v2_ft+catboost",
+    # ours (final): PHE portfolio + TabPFN-GBX members + CatBoost
+    f"ens_gbx_phe={_PHE}+tabpfn_gbx_te+gbx_onehot?+catboost",
+    # ours (final + fine-tuned TabPFN v2 as an extra member)
+    f"ens_gbx_phe_ft={_PHE}+tabpfn_gbx_te+gbx_onehot?+catboost+tabpfn_v2_ft?",
 ]
 
 
@@ -37,7 +46,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--bench", default="results/benchmark")
     ap.add_argument("--specs", nargs="*", default=DEFAULT_SPECS)
-    ap.add_argument("--n_iter", type=int, default=25)
+    ap.add_argument("--n_iter", type=int, default=40)
     a = ap.parse_args()
 
     files = glob.glob(os.path.join(a.bench, "preds", "*.npz"))
@@ -56,10 +65,15 @@ def main():
 
     n_new = 0
     for spec in a.specs:
-        name, members = spec.split("=")
-        members = members.split("+")
+        name, members_all = spec.split("=")
+        members_all = members_all.split("+")
+        required = [m for m in members_all if not m.endswith("?")]
+        optional = [m[:-1] for m in members_all if m.endswith("?")]
         for (dname, fold), mp in sorted(index.items()):
-            if (dname, fold, name) in done or not all(m in mp for m in members):
+            if (dname, fold, name) in done or not all(m in mp for m in required):
+                continue
+            members = required + [m for m in optional if m in mp]
+            if len(members) < 2:
                 continue
             Z = [np.load(mp[m]) for m in members]
             if not all("p_val" in z for z in Z):
