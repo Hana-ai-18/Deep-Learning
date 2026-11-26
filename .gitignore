@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+openml_cache/
+logs/
+results/benchmark/
+results/nano/
+results/report/
+*.pt
+.ipynb_checkpoints/

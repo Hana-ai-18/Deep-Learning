@@ -1,0 +1,134 @@
+#!/usr/bin/env python
+"""Benchmark TabPFN v2 (and its fine-tuned variant) against classical baselines.
+
+Part A (reproduction) and Part B-1 (TabPFN-level improvement) both use this
+script; only the list of methods differs.
+
+For every dataset x fold x method it stores
+  * a row in ``<out>/metrics.jsonl`` (ROC-AUC, accuracy, log-loss, timings)
+  * the predicted probabilities in ``<out>/preds/<dataset>__f<k>__<method>.npz``
+With ``--val_preds`` every model is additionally fit on an inner 80 % split of
+the training fold and evaluated on the remaining 20 % (needed by
+``run_ensembles.py``). Runs are resumable: finished (dataset, fold, method)
+triples are skipped, so a Kaggle session can be restarted safely.
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+import time
+import traceback
+
+import numpy as np
+import pandas as pd
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
+
+from tabdl.data import get_datasets, holdout_split, make_folds  # noqa: E402
+from tabdl.metrics import all_metrics, fix_proba  # noqa: E402
+from tabdl.models import has_cuda, make_model  # noqa: E402
+from tabdl.utils import append_jsonl, free_gpu, set_seed, slug  # noqa: E402
+
+
+def parse():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--source", default="auto", choices=["auto", "openml", "sklearn"])
+    ap.add_argument("--max_rows", type=int, default=3000)
+    ap.add_argument("--max_features", type=int, default=100)
+    ap.add_argument("--max_classes", type=int, default=10)
+    ap.add_argument("--max_datasets", type=int, default=None)
+    ap.add_argument("--n_folds", type=int, default=3)
+    ap.add_argument("--methods", default="logreg,rf,xgb,lgbm,catboost,tabpfn_v2")
+    ap.add_argument("--val_preds", action="store_true",
+                    help="also store inner-validation predictions (for ensembles)")
+    ap.add_argument("--val_frac", type=float, default=0.2)
+    ap.add_argument("--ckpt", default="original", help="TabPFN v2 checkpoint: original|default")
+    ap.add_argument("--n_estimators", type=int, default=8)
+    ap.add_argument("--ft_time_limit", type=int, default=60)
+    ap.add_argument("--ft_epochs", type=int, default=30)
+    ap.add_argument("--ft_lr", type=float, default=1e-5)
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--cache_dir", default=os.environ.get("OPENML_CACHE", "openml_cache"))
+    ap.add_argument("--out", default="results/benchmark")
+    return ap.parse_args()
+
+
+def fit_predict(method, Xtr, ytr, Xte, cat_idx, seed, n_classes, cfg):
+    model = make_model(method, cat_idx, seed, n_classes, cfg)
+    t0 = time.time()
+    model.fit(Xtr, ytr)
+    t1 = time.time()
+    p = model.predict_proba(Xte)
+    t2 = time.time()
+    # map model class order -> global labels (models only know classes seen in ytr)
+    seen = np.unique(ytr)
+    p = np.asarray(p)
+    if p.shape[1] == len(seen) and len(seen) < n_classes:
+        full = np.zeros((p.shape[0], n_classes))
+        full[:, seen] = p
+        p = full
+    del model
+    free_gpu()
+    return fix_proba(p, n_classes), t1 - t0, t2 - t1
+
+
+def main():
+    a = parse()
+    os.makedirs(os.path.join(a.out, "preds"), exist_ok=True)
+    set_seed(a.seed)
+    methods = [m.strip() for m in a.methods.split(",") if m.strip()]
+    cfg = dict(ckpt=a.ckpt, n_estimators=a.n_estimators, ft_time_limit=a.ft_time_limit,
+               ft_epochs=a.ft_epochs, ft_lr=a.ft_lr)
+    print(f"CUDA available: {has_cuda()} | methods: {methods}")
+
+    datasets = get_datasets(a.source, max_rows=a.max_rows, max_features=a.max_features,
+                            max_classes=a.max_classes, max_datasets=a.max_datasets,
+                            cache_dir=a.cache_dir)
+    pd.DataFrame([dict(name=d.name, did=d.did, n=d.X.shape[0], d=d.X.shape[1],
+                       n_classes=d.n_classes, n_cat=len(d.cat_idx),
+                       missing_frac=float(np.isnan(d.X).mean()), source=d.source)
+                  for d in datasets]).to_csv(os.path.join(a.out, "datasets.csv"), index=False)
+    print(f"{len(datasets)} datasets")
+
+    metrics_path = os.path.join(a.out, "metrics.jsonl")
+    for di, ds in enumerate(datasets):
+        dname = slug(ds.name if ds.did is None else f"{ds.name}_{ds.did}")
+        folds = make_folds(ds.y, a.n_folds, seed=a.seed)
+        for k, (tr, te) in enumerate(folds):
+            Xtr, ytr, Xte, yte = ds.X[tr], ds.y[tr], ds.X[te], ds.y[te]
+            if a.val_preds:
+                itr, iva = holdout_split(ytr, a.val_frac, seed=a.seed + k)
+            for m in methods:
+                fpath = os.path.join(a.out, "preds", f"{dname}__f{k}__{m}.npz")
+                if os.path.exists(fpath):
+                    continue
+                row = dict(dataset=dname, did=ds.did, n=int(ds.X.shape[0]),
+                           d=int(ds.X.shape[1]), n_classes=ds.n_classes, fold=k, method=m)
+                try:
+                    seed = a.seed + 1000 * k
+                    p_te, tfit, tpred = fit_predict(m, Xtr, ytr, Xte, ds.cat_idx, seed,
+                                                    ds.n_classes, cfg)
+                    save = dict(p_test=p_te, y_test=yte)
+                    if a.val_preds:
+                        p_va, _, _ = fit_predict(m, Xtr[itr], ytr[itr], Xtr[iva], ds.cat_idx,
+                                                 seed, ds.n_classes, cfg)
+                        save.update(p_val=p_va, y_val=ytr[iva])
+                    np.savez_compressed(fpath, **save)
+                    row.update(all_metrics(yte, p_te, ds.n_classes), fit_time=tfit,
+                               predict_time=tpred, status="ok")
+                    print(f"[{di + 1}/{len(datasets)}] {dname} f{k} {m:14s} "
+                          f"AUC={row['roc_auc']:.4f} acc={row['accuracy']:.4f} "
+                          f"ll={row['log_loss']:.4f} t={tfit + tpred:.1f}s", flush=True)
+                except Exception as e:  # noqa: BLE001
+                    row.update(status="error", error=f"{type(e).__name__}: {e}")
+                    print(f"[ERR] {dname} f{k} {m}: {e}", flush=True)
+                    traceback.print_exc(limit=2)
+                    free_gpu()
+                append_jsonl(metrics_path, row)
+    print("done ->", metrics_path)
+
+
+if __name__ == "__main__":
+    main()
