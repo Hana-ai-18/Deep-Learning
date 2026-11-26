@@ -3,60 +3,54 @@ import os
 import sys
 
 import numpy as np
-import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 
+from tabdl.augment import OOFTargetEncoder  # noqa: E402
+from tabdl.data import load_sklearn_datasets, make_folds  # noqa: E402
 from tabdl.ensemble import blend, caruana_weights  # noqa: E402
-from tabdl.metrics import all_metrics  # noqa: E402
-from tabdl.nano.evaluate import nano_predict_proba  # noqa: E402
-from tabdl.nano.model import ModelConfig  # noqa: E402
-from tabdl.nano.prior import PriorConfig, sample_batch  # noqa: E402
-from tabdl.nano.train import VARIANTS, build_model, build_optimizer, TrainConfig, _loss  # noqa: E402
+from tabdl.metrics import all_metrics, roc_auc  # noqa: E402
+from tabdl.models import make_model  # noqa: E402
 
 
-def test_prior():
-    g = torch.Generator().manual_seed(0)
-    b = sample_batch(4, PriorConfig(max_rows=64, max_features=6), g, "cpu")
-    assert b["X"].ndim == 3 and torch.isfinite(b["X"]).all()
-    assert (b["y"] < b["n_classes"][:, None]).all()
+def _cat_problem(n=900, k=20, seed=1, random_labels=False):
+    rng = np.random.default_rng(seed)
+    X = np.column_stack([rng.integers(0, k, n), rng.integers(0, k, n),
+                         rng.normal(size=(n, 3))]).astype(float)
+    eff = rng.normal(size=k) * 1.5
+    logit = eff[X[:, 0].astype(int)] + X[:, 2]
+    y = (rng.random(n) < 1 / (1 + np.exp(-logit))).astype(int)
+    if random_labels:
+        y = rng.integers(0, 2, n)
+    return X, y
 
 
-def test_variants_train_step():
-    mc = ModelConfig(d_model=32, n_heads=4, n_layers=2, d_ff=64)
-    pc = PriorConfig(max_rows=48, max_features=5)
-    g = torch.Generator().manual_seed(1)
-    batch = sample_batch(4, pc, g, "cpu")
-    for v in VARIANTS:
-        torch.manual_seed(0)
-        m = build_model(v, mc)
-        opt = build_optimizer(m, v, TrainConfig(variant=v))
-        loss, _ = _loss(m, batch, amp=False, device=torch.device("cpu"))
-        loss.backward()
-        opt.step()
-        assert torch.isfinite(loss), v
-        # test rows must not influence each other: permuting test rows permutes outputs
-        m.eval()
-        n = batch["n_train"]
-        X = batch["X"][:1]
-        y = batch["y"][:1, :n]
-        perm = torch.randperm(X.shape[1] - n) + n
-        Xp = torch.cat([X[:, :n], X[:, perm]], 1)
-        g1 = torch.Generator().manual_seed(5)
-        g2 = torch.Generator().manual_seed(5)
-        o1 = m(X, y, col_gen=g1)
-        o2 = m(Xp, y, col_gen=g2)
-        assert torch.allclose(o1[:, perm - n], o2, atol=1e-4), v
+def test_target_encoder_shapes():
+    X, y = _cat_problem()
+    te = OOFTargetEncoder([0, 1], 2, n_folds=5)
+    A = te.fit_transform(X, y)
+    B = te.transform(X[:10])
+    assert A.shape == (len(X), 2) and B.shape == (10, 2)
+    assert np.all((A > 0) & (A < 1))
 
 
-def test_nano_predict():
-    mc = ModelConfig(d_model=32, n_heads=4, n_layers=2, d_ff=64)
-    m = build_model("full", mc).eval()
-    rng = np.random.default_rng(0)
-    Xtr, ytr = rng.normal(size=(40, 7)), rng.integers(0, 3, 40)
-    Xte = rng.normal(size=(300, 7))
-    p = nano_predict_proba(m, Xtr, ytr, Xte, 3, n_ens=3, device="cpu", test_chunk=128)
-    assert p.shape == (300, 3) and np.allclose(p.sum(1), 1, atol=1e-5)
+def test_no_label_leakage():
+    """On random labels the augmented model must stay at chance level."""
+    X, y = _cat_problem(random_labels=True)
+    m = make_model("logreg_gbx_te", [0, 1], 0, 2, {"gbx_folds": 4})
+    m.fit(X[:600], y[:600])
+    auc = roc_auc(y[600:], m.predict_proba(X[600:]), 2)
+    assert 0.38 < auc < 0.62, auc
+
+
+def test_augmentation_helps_on_categorical_signal():
+    X, y = _cat_problem()
+    aucs = {}
+    for name in ["logreg", "logreg_gbx_te"]:
+        m = make_model(name, [0, 1], 0, 2, {"gbx_folds": 4})
+        m.fit(X[:600], y[:600])
+        aucs[name] = roc_auc(y[600:], m.predict_proba(X[600:]), 2)
+    assert aucs["logreg_gbx_te"] > aucs["logreg"] + 0.05, aucs
 
 
 def test_metrics_and_ensemble():
@@ -68,6 +62,14 @@ def test_metrics_and_ensemble():
     assert w[1] > w[0]
     m = all_metrics(y, blend([p1, p2], w, 3), 3)
     assert 0.5 < m["roc_auc"] <= 1.0
+
+
+def test_data():
+    ds = load_sklearn_datasets()
+    assert len(ds) >= 4
+    for d in ds:
+        folds = make_folds(d.y, 3)
+        assert all(len(np.unique(d.y[tr])) == d.n_classes for tr, _ in folds)
 
 
 if __name__ == "__main__":

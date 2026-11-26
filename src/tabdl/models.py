@@ -181,4 +181,29 @@ def make_model(name: str, cat_idx, seed: int, n_classes: int, cfg: dict | None =
                                         time_limit=cfg.get("ft_time_limit", 60),
                                         epochs=cfg.get("ft_epochs", 30),
                                         learning_rate=cfg.get("ft_lr", 1e-5))
+    if name in AUGMENTED:
+        from .augment import AugmentedICL
+        base, te, gbx = AUGMENTED[name]
+        if base == "tabpfn_v2":
+            def factory(ci):
+                return TabPFNv2Wrapper(ci, seed, n_estimators=cfg.get("n_estimators", 8),
+                                       ckpt=cfg.get("ckpt", "original"))
+            gbdt = "catboost"
+        else:                                   # CPU stand-in used only by the tests
+            def factory(ci):
+                return make_baseline(base, ci, seed, n_classes)
+            gbdt = "lgbm"
+        return AugmentedICL(factory, cat_idx, n_classes, use_te=te, use_gbx=gbx,
+                            n_folds=cfg.get("gbx_folds", 5),
+                            gbdt_iterations=cfg.get("gbx_iterations", 500),
+                            seed=seed, gbdt_model=cfg.get("gbx_model", gbdt))
     return make_baseline(name, cat_idx, seed, n_classes)
+
+
+# name -> (base model, use target encoding, use OOF-GBDT logits)
+AUGMENTED = {
+    "tabpfn_te":       ("tabpfn_v2", True,  False),   # ablation: categorical fix only
+    "tabpfn_gbx":      ("tabpfn_v2", False, True),    # ablation: GBDT logits only
+    "tabpfn_gbx_te":   ("tabpfn_v2", True,  True),    # TabPFN-GBX (ours)
+    "logreg_gbx_te":   ("logreg",    True,  True),    # CPU stand-in for tests
+}

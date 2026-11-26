@@ -23,9 +23,13 @@ from tabdl.metrics import all_metrics  # noqa: E402
 from tabdl.utils import append_jsonl, read_jsonl  # noqa: E402
 
 DEFAULT_SPECS = [
+    # existing practice: blend TabPFN v2 (or its fine-tuned version) with CatBoost
     "ens_pfn_cat=tabpfn_v2+catboost",
     "ens_ft_cat=tabpfn_v2_ft+catboost",
-    "ens_pfn_ft_cat=tabpfn_v2+tabpfn_v2_ft+catboost",
+    # ours: TabPFN-GBX + plain TabPFN v2 + CatBoost
+    "ens_gbx=tabpfn_v2+tabpfn_gbx_te+catboost",
+    # ours (full portfolio): also lets the selector use the fine-tuned TabPFN v2
+    "ens_gbx_ft=tabpfn_v2+tabpfn_gbx_te+tabpfn_v2_ft+catboost",
 ]
 
 

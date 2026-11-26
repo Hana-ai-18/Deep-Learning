@@ -19,6 +19,7 @@ import os
 import sys
 import time
 import traceback
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -49,6 +50,8 @@ def parse():
     ap.add_argument("--ft_time_limit", type=int, default=60)
     ap.add_argument("--ft_epochs", type=int, default=30)
     ap.add_argument("--ft_lr", type=float, default=1e-5)
+    ap.add_argument("--gbx_folds", type=int, default=5, help="K of the OOF cross-fitting")
+    ap.add_argument("--gbx_iterations", type=int, default=500, help="CatBoost trees (GBX)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--cache_dir", default=os.environ.get("OPENML_CACHE", "openml_cache"))
     ap.add_argument("--out", default="results/benchmark")
@@ -75,12 +78,15 @@ def fit_predict(method, Xtr, ytr, Xte, cat_idx, seed, n_classes, cfg):
 
 
 def main():
+    warnings.filterwarnings("ignore", category=UserWarning)
+    warnings.filterwarnings("ignore", category=FutureWarning)
     a = parse()
     os.makedirs(os.path.join(a.out, "preds"), exist_ok=True)
     set_seed(a.seed)
     methods = [m.strip() for m in a.methods.split(",") if m.strip()]
     cfg = dict(ckpt=a.ckpt, n_estimators=a.n_estimators, ft_time_limit=a.ft_time_limit,
-               ft_epochs=a.ft_epochs, ft_lr=a.ft_lr)
+               ft_epochs=a.ft_epochs, ft_lr=a.ft_lr, gbx_folds=a.gbx_folds,
+               gbx_iterations=a.gbx_iterations)
     print(f"CUDA available: {has_cuda()} | methods: {methods}")
 
     datasets = get_datasets(a.source, max_rows=a.max_rows, max_features=a.max_features,

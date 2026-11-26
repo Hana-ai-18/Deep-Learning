@@ -1,15 +1,13 @@
 #!/usr/bin/env python
-"""Aggregate all results into tables (Markdown + CSV) and figures (PNG).
+"""Aggregate benchmark results into tables (Markdown + CSV) and figures (PNG).
 
-Usage:
-  python scripts/make_report.py --bench results/benchmark --nano results/nano \
-      --out results/report
-Either input may be missing; the corresponding sections are skipped.
+Usage:  python scripts/make_report.py --bench results/benchmark --out results/report
+Section A is written as soon as the reproduction methods exist; section B as
+soon as at least one improvement method exists.
 """
 from __future__ import annotations
 
 import argparse
-import glob
 import os
 import sys
 
@@ -18,20 +16,26 @@ import pandas as pd
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 
-from tabdl.utils import read_jsonl  # noqa: E402
+from tabdl.utils import read_jsonl, slug  # noqa: E402
 
-REPRO_METHODS = ["logreg", "knn", "rf", "xgb", "lgbm", "catboost", "tabpfn_v2"]
+BASELINES = ["logreg", "knn", "rf", "xgb", "lgbm", "catboost"]
+REPRO_METHODS = BASELINES + ["tabpfn_v2"]
+EXISTING = ["tabpfn_v2", "catboost", "tabpfn_v2_ft", "ens_pfn_cat", "ens_ft_cat"]
+OURS = ["tabpfn_te", "tabpfn_gbx", "tabpfn_gbx_te", "ens_gbx", "ens_gbx_ft"]
 NICE = {
     "logreg": "Logistic Regression", "knn": "kNN", "rf": "Random Forest",
     "xgb": "XGBoost", "lgbm": "LightGBM", "catboost": "CatBoost",
-    "tabpfn_v2": "TabPFN v2", "tabpfn_v2_ft": "TabPFN v2 + fine-tune",
-    "ens_pfn_cat": "Ens(TabPFN v2, CatBoost)",
-    "ens_ft_cat": "Ens(TabPFN v2-FT, CatBoost)",
-    "ens_pfn_ft_cat": "Ens(TabPFN v2, TabPFN v2-FT, CatBoost)",
-    "nano_base": "nanoTabPFN (baseline)", "nano_dyt": "+ DyT",
-    "nano_gate": "+ Gated Attention", "nano_muon": "+ Muon",
-    "nano_gate_muon": "+ Gated Attn + Muon", "nano_full": "+ DyT + Gated Attn + Muon",
+    "tabpfn_v2": "TabPFN v2 (original)",
+    "tabpfn_v2_ft": "TabPFN v2 + fine-tuning [existing]",
+    "ens_pfn_cat": "Ens(TabPFN v2, CatBoost) [existing]",
+    "ens_ft_cat": "Ens(TabPFN v2-FT, CatBoost) [existing]",
+    "tabpfn_te": "TabPFN v2 + OOF-TE [ours, ablation]",
+    "tabpfn_gbx": "TabPFN v2 + OOF-GBDT logits [ours, ablation]",
+    "tabpfn_gbx_te": "TabPFN-GBX [ours]",
+    "ens_gbx": "TabPFN-GBX-Ens [ours]",
+    "ens_gbx_ft": "TabPFN-GBX-Ens + FT [ours, full]",
 }
+METRICS = ["roc_auc", "accuracy", "log_loss"]
 
 
 def nice(m):
@@ -42,73 +46,102 @@ def load_ok(path):
     rows = [r for r in read_jsonl(path) if r.get("status") == "ok"]
     if not rows:
         return pd.DataFrame()
-    df = pd.DataFrame(rows)
-    # keep the last successful row per (dataset, fold, method)
-    return df.drop_duplicates(["dataset", "fold", "method"], keep="last")
+    return pd.DataFrame(rows).drop_duplicates(["dataset", "fold", "method"], keep="last")
 
 
-def per_dataset(df, col="method"):
-    return df.groupby(["dataset", col])[["roc_auc", "accuracy", "log_loss"]].mean().reset_index()
+def per_dataset(df):
+    return df.groupby(["dataset", "method"])[METRICS].mean().reset_index()
 
 
-def complete_datasets(pdf, methods, col="method"):
-    ok = pdf.groupby("dataset")[col].apply(lambda s: set(methods) <= set(s))
-    return ok[ok].index.tolist()
+def coverage_filter(pdf, methods, min_frac=0.9):
+    """Keep methods that cover >= min_frac of the datasets covered by the best one."""
+    cov = pdf[pdf["method"].isin(methods)].groupby("method")["dataset"].nunique()
+    if cov.empty:
+        return []
+    keep = [m for m in methods if m in cov and cov[m] >= min_frac * cov.max()]
+    dropped = [m for m in methods if m in cov and m not in keep]
+    if dropped:
+        print(f"[note] low coverage, excluded from joint table: {dropped}")
+    return keep
 
 
-def summary_table(pdf, methods, ref=None, col="method", time_df=None):
-    dsets = complete_datasets(pdf, methods, col)
-    sub = pdf[pdf["dataset"].isin(dsets) & pdf[col].isin(methods)]
-    piv = sub.pivot(index="dataset", columns=col, values="roc_auc")[methods]
-    ranks = piv.rank(axis=1, ascending=False).mean()
+def joint(pdf, methods, value="roc_auc"):
+    piv = pdf[pdf["method"].isin(methods)].pivot(index="dataset", columns="method",
+                                                  values=value)
+    return piv[methods].dropna()
+
+
+def summary_table(pdf, methods, ref, times=None):
+    piv_auc = joint(pdf, methods, "roc_auc")
+    dsets = piv_auc.index
+    sub = pdf[pdf["dataset"].isin(dsets) & pdf["method"].isin(methods)]
+    ranks = piv_auc.rank(axis=1, ascending=False).mean()
     rows = []
     for m in methods:
-        s = sub[sub[col] == m]
-        r = dict(Method=nice(m), key=m, AUC=s["roc_auc"].mean(), Acc=s["accuracy"].mean(),
-                 LogLoss=s["log_loss"].mean(), MeanRank=ranks[m])
-        if ref is not None and m != ref:
-            diff = piv[m] - piv[ref]
-            r["Win/Tie/Loss vs " + nice(ref)] = \
-                f"{int((diff > 1e-4).sum())}/{int((diff.abs() <= 1e-4).sum())}/{int((diff < -1e-4).sum())}"
+        s = sub[sub["method"] == m]
+        r = {"Method": nice(m), "key": m, "AUC": s["roc_auc"].mean(),
+             "Acc": s["accuracy"].mean(), "LogLoss": s["log_loss"].mean(),
+             "MeanRank": ranks[m]}
+        if m != ref:
+            d = piv_auc[m] - piv_auc[ref]
+            r["ΔAUC vs ref"] = d.mean()
+            r["W/T/L vs ref"] = (f"{int((d > 1e-4).sum())}/{int((d.abs() <= 1e-4).sum())}/"
+                                 f"{int((d < -1e-4).sum())}")
             try:
                 from scipy.stats import wilcoxon
-                r["p (Wilcoxon)"] = float(wilcoxon(piv[m], piv[ref]).pvalue) \
-                    if (diff.abs() > 1e-12).any() else 1.0
+                r["p (Wilcoxon)"] = float(wilcoxon(piv_auc[m], piv_auc[ref]).pvalue) \
+                    if (d.abs() > 1e-12).any() else 1.0
             except Exception:  # noqa: BLE001
                 r["p (Wilcoxon)"] = np.nan
-        if time_df is not None and m in time_df.index:
-            r["Time/fold (s)"] = time_df[m]
+        else:
+            r["W/T/L vs ref"] = "(reference)"
+        if times is not None and m in times.index:
+            r["Time/fold (s)"] = times[m]
         rows.append(r)
     out = pd.DataFrame(rows).sort_values("MeanRank").reset_index(drop=True)
-    for c in out.columns:
-        if c.startswith("Win/Tie/Loss"):
-            out[c] = out[c].fillna("(reference)")
-    return out, piv, len(dsets)
+    order = ["Method", "key", "AUC", "Acc", "LogLoss", "MeanRank", "ΔAUC vs ref",
+             "W/T/L vs ref", "p (Wilcoxon)", "Time/fold (s)"]
+    return out[[c for c in order if c in out.columns]], piv_auc
 
 
 def fmt(df):
-    df = df.drop(columns=[c for c in ["key"] if c in df.columns])
-    return df.to_markdown(index=False, floatfmt=".4f")
+    return df.drop(columns=["key"], errors="ignore").to_markdown(index=False, floatfmt=".4f")
 
 
-def bench_times(df):
-    d = df.copy()
-    if "fit_time" not in d:
+def method_times(df):
+    if "fit_time" not in df:
         return None
+    d = df.copy()
     d["t"] = d["fit_time"].fillna(0) + d["predict_time"].fillna(0)
     t = d[d["t"] > 0].groupby("method")["t"].mean()
+    # an ensemble costs its members fitted twice (inner split + full fold)
+    for ens, mem in [("ens_pfn_cat", ["tabpfn_v2", "catboost"]),
+                     ("ens_ft_cat", ["tabpfn_v2_ft", "catboost"]),
+                     ("ens_gbx", ["tabpfn_v2", "tabpfn_gbx_te", "catboost"]),
+                     ("ens_gbx_ft", ["tabpfn_v2", "tabpfn_gbx_te", "tabpfn_v2_ft", "catboost"])]:
+        if all(m in t.index for m in mem):
+            t[ens] = 2 * sum(t[m] for m in mem)
     return t
 
 
-def plot_bar(values: pd.Series, title, xlabel, path, lower_better=False):
+# --------------------------------------------------------------------------- #
+# figures
+# --------------------------------------------------------------------------- #
+def _plt():
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    v = values.sort_values(ascending=lower_better)
-    fig, ax = plt.subplots(figsize=(7, 0.45 * len(v) + 1.2))
-    ax.barh([nice(i) for i in v.index][::-1], v.values[::-1], color="#4C72B0")
-    for i, x in enumerate(v.values[::-1]):
-        ax.text(x, i, f" {x:.3f}", va="center", fontsize=8)
+    return plt
+
+
+def plot_bar(values: pd.Series, title, xlabel, path, lower_better=False, highlight=()):
+    plt = _plt()
+    v = values.sort_values(ascending=not lower_better)
+    fig, ax = plt.subplots(figsize=(7.5, 0.42 * len(v) + 1.3))
+    colors = ["#C44E52" if k in highlight else "#4C72B0" for k in v.index]
+    ax.barh([nice(i) for i in v.index], v.values, color=colors)
+    for i, x in enumerate(v.values):
+        ax.text(x, i, f" {x:.4f}", va="center", fontsize=8)
     ax.set_xlabel(xlabel)
     ax.set_title(title)
     fig.tight_layout()
@@ -116,179 +149,165 @@ def plot_bar(values: pd.Series, title, xlabel, path, lower_better=False):
     plt.close(fig)
 
 
-def plot_scatter(piv, a, b, path):
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    fig, ax = plt.subplots(figsize=(4.5, 4.5))
-    ax.scatter(piv[b], piv[a], s=18)
-    lo = float(min(piv[a].min(), piv[b].min())) - 0.01
-    ax.plot([lo, 1], [lo, 1], "k--", lw=1)
-    ax.set_xlabel(f"{nice(b)} ROC-AUC")
-    ax.set_ylabel(f"{nice(a)} ROC-AUC")
-    ax.set_title("Per-dataset ROC-AUC")
+def plot_scatter(x, y, xlabel, ylabel, title, path, labels=None):
+    plt = _plt()
+    fig, ax = plt.subplots(figsize=(5.2, 4.6))
+    ax.scatter(x, y, s=22)
+    ax.axhline(0, color="k", lw=0.8)
+    ax.axvline(0, color="k", lw=0.8, ls=":")
+    if labels is not None:
+        for xi, yi, lb in zip(x, y, labels):
+            if abs(yi) > 0.004 or xi < -0.005:
+                ax.annotate(lb.rsplit("_", 1)[0][:18], (xi, yi), fontsize=6)
+    if len(x) > 2:
+        from scipy.stats import spearmanr
+        rho, p = spearmanr(x, y)
+        ax.set_title(f"{title}\nSpearman ρ = {rho:.2f} (p = {p:.3f})", fontsize=9)
+    else:
+        ax.set_title(title, fontsize=9)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
     fig.tight_layout()
     fig.savefig(path, dpi=150)
     plt.close(fig)
 
 
 # --------------------------------------------------------------------------- #
-def section_bench(bench_dirs, out, md):
-    frames = [load_ok(os.path.join(b, "metrics.jsonl")) for b in bench_dirs]
-    frames = [f for f in frames if len(f)]
-    if not frames:
+def dataset_meta(bench):
+    p = os.path.join(bench, "datasets.csv")
+    if not os.path.exists(p):
+        return None
+    m = pd.read_csv(p)
+    m["dataset"] = [slug(n if pd.isna(d) else f"{n}_{int(d)}") for n, d in zip(m["name"], m["did"])]
+    return m.set_index("dataset")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--bench", default="results/benchmark")
+    ap.add_argument("--out", default="results/report")
+    a = ap.parse_args()
+    os.makedirs(a.out, exist_ok=True)
+    df = load_ok(os.path.join(a.bench, "metrics.jsonl"))
+    if df.empty:
+        print("no results yet")
         return
-    df = pd.concat(frames).drop_duplicates(["dataset", "fold", "method"], keep="last")
-    df.to_csv(os.path.join(out, "benchmark_all_rows.csv"), index=False)
+    df.to_csv(os.path.join(a.out, "all_rows.csv"), index=False)
     pdf = per_dataset(df)
-    times = bench_times(df)
-    for ens, members in [("ens_pfn_cat", ["tabpfn_v2", "catboost"]),
-                         ("ens_ft_cat", ["tabpfn_v2_ft", "catboost"]),
-                         ("ens_pfn_ft_cat", ["tabpfn_v2", "tabpfn_v2_ft", "catboost"])]:
-        if times is not None and all(m in times.index for m in members):
-            times[ens] = 2 * sum(times[m] for m in members)   # members fit twice
-    # ---- Part A: reproduction ----
-    repro = [m for m in REPRO_METHODS if m in set(pdf["method"])]
+    times = method_times(df)
+    meta = dataset_meta(a.bench)
+    present = set(pdf["method"])
+    md = ["# Results\n"]
+
+    # ------------------------------ Part A ------------------------------ #
+    repro = coverage_filter(pdf, [m for m in REPRO_METHODS if m in present])
     if "tabpfn_v2" in repro and len(repro) > 1:
-        tab, piv, nd = summary_table(pdf, repro, ref="tabpfn_v2", time_df=times)
-        tab.to_csv(os.path.join(out, "table_A_reproduction.csv"), index=False)
-        piv.to_csv(os.path.join(out, "table_A_per_dataset_auc.csv"))
-        md.append(f"## Part A - Reproduction: TabPFN v2 vs. baselines ({nd} datasets)\n")
-        md.append("Mean over datasets of the fold-averaged metric; MeanRank is the "
-                  "average rank by ROC-AUC (1 = best).\n")
-        md.append(fmt(tab) + "\n")
-        plot_bar(tab.set_index("key")["MeanRank"], "Part A: mean rank (ROC-AUC)",
-                 "mean rank (lower is better)", os.path.join(out, "fig_A_rank.png"),
-                 lower_better=True)
-        if "catboost" in piv:
-            plot_scatter(piv, "tabpfn_v2", "catboost", os.path.join(out, "fig_A_scatter.png"))
-        md.append("![rank](fig_A_rank.png) ![scatter](fig_A_scatter.png)\n")
-    # ---- Part B-1: TabPFN-level improvements ----
-    imp = [m for m in ["catboost", "tabpfn_v2", "tabpfn_v2_ft", "ens_pfn_cat", "ens_ft_cat",
-                       "ens_pfn_ft_cat"] if m in set(pdf["method"])]
-    if len(imp) > 2 and "tabpfn_v2" in imp:
-        tab, piv, nd = summary_table(pdf, imp, ref="tabpfn_v2", time_df=times)
-        tab.to_csv(os.path.join(out, "table_B1_improvement.csv"), index=False)
-        piv.to_csv(os.path.join(out, "table_B1_per_dataset_auc.csv"))
-        md.append(f"## Part B-1 - Improving TabPFN v2 on each dataset ({nd} datasets)\n")
-        md.append(fmt(tab) + "\n")
-        plot_bar(tab.set_index("key")["LogLoss"], "Part B-1: mean log-loss",
-                 "log-loss (lower is better)", os.path.join(out, "fig_B1_logloss.png"),
-                 lower_better=True)
-        md.append("![b1](fig_B1_logloss.png)\n")
+        tab, piv = summary_table(pdf, repro, "tabpfn_v2", times)
+        tab.to_csv(os.path.join(a.out, "table_A_reproduction.csv"), index=False)
+        piv.to_csv(os.path.join(a.out, "table_A_per_dataset_auc.csv"))
+        md += [f"## Part A — Reproduction: TabPFN v2 vs. baselines ({len(piv)} datasets)\n",
+               "Mean over datasets of the fold-averaged metric. MeanRank = average rank by "
+               "ROC-AUC (1 = best). Reference = TabPFN v2.\n", fmt(tab) + "\n"]
+        plot_bar(tab.set_index("key")["MeanRank"], "Part A: mean rank by ROC-AUC",
+                 "mean rank (lower is better)", os.path.join(a.out, "fig_A_rank.png"),
+                 lower_better=True, highlight=("tabpfn_v2",))
+        md.append("![rank](fig_A_rank.png)\n")
+        # where is TabPFN v2 weak?
+        base_cols = [b for b in BASELINES if b in piv]
+        gap = (piv["tabpfn_v2"] - piv[base_cols].max(axis=1)).rename("tabpfn_minus_best_baseline")
+        gap.to_csv(os.path.join(a.out, "table_A_weakness_gap.csv"))
+        weak = gap[gap < -1e-4].sort_values()
+        lines = []
+        for d, g in weak.items():
+            r = dict(Dataset=d, Gap=g, BestBaseline=nice(piv.loc[d, base_cols].idxmax()))
+            if meta is not None and d in meta.index:
+                r.update(n=int(meta.loc[d, "n"]), d=int(meta.loc[d, "d"]),
+                         n_cat=int(meta.loc[d, "n_cat"]))
+            lines.append(r)
+        if lines:
+            md += [f"**Where TabPFN v2 loses** ({len(weak)}/{len(gap)} datasets; "
+                   "Gap = AUC(TabPFN v2) − AUC(best baseline)):\n",
+                   pd.DataFrame(lines).to_markdown(index=False, floatfmt=".4f") + "\n"]
+            if meta is not None:
+                has_cat = meta.reindex(gap.index)["n_cat"] > 0
+                md.append(f"Mean gap on datasets **with** categorical features: "
+                          f"{gap[has_cat].mean():+.4f} ({int(has_cat.sum())} datasets); "
+                          f"**without**: {gap[~has_cat].mean():+.4f} "
+                          f"({int((~has_cat).sum())} datasets).\n")
+
+    # ------------------------------ Part B ------------------------------ #
+    imp = [m for m in EXISTING + OURS if m in present]
+    if "tabpfn_v2" in imp and any(m in present for m in OURS + ["tabpfn_v2_ft"]):
+        imp = coverage_filter(pdf, imp)
+        tab, piv = summary_table(pdf, imp, "tabpfn_v2", times)
+        tab.to_csv(os.path.join(a.out, "table_B_improvement.csv"), index=False)
+        piv.to_csv(os.path.join(a.out, "table_B_per_dataset_auc.csv"))
+        md += [f"## Part B — Improving TabPFN v2 ({len(piv)} datasets)\n",
+               "Reference = original TabPFN v2. ΔAUC > 0 and W/T/L show improvement; "
+               "p = two-sided Wilcoxon signed-rank test over datasets.\n", fmt(tab) + "\n"]
+        dl = joint(pdf, imp, "log_loss")
+        dacc = joint(pdf, imp, "accuracy")
+        delta = pd.DataFrame({
+            "ΔAUC": (piv.sub(piv["tabpfn_v2"], axis=0)).mean(),
+            "ΔAcc": (dacc.sub(dacc["tabpfn_v2"], axis=0)).mean(),
+            "ΔLogLoss": (dl.sub(dl["tabpfn_v2"], axis=0)).mean(),
+        }).drop(index="tabpfn_v2")
+        delta.index = [nice(i) for i in delta.index]
+        delta.to_csv(os.path.join(a.out, "table_B_deltas.csv"))
+        md += ["Average change w.r.t. TabPFN v2 (LogLoss: negative = better):\n",
+               delta.to_markdown(floatfmt="+.4f") + "\n"]
+        plot_bar((piv.sub(piv["tabpfn_v2"], axis=0)).mean().drop("tabpfn_v2"),
+                 "Part B: mean ΔROC-AUC vs. TabPFN v2", "ΔAUC (higher is better)",
+                 os.path.join(a.out, "fig_B_delta_auc.png"), highlight=tuple(OURS))
+        plot_bar((dl.sub(dl["tabpfn_v2"], axis=0)).mean().drop("tabpfn_v2"),
+                 "Part B: mean Δlog-loss vs. TabPFN v2", "Δlog-loss (lower is better)",
+                 os.path.join(a.out, "fig_B_delta_logloss.png"), lower_better=True,
+                 highlight=tuple(OURS))
+        md.append("![dauc](fig_B_delta_auc.png) ![dll](fig_B_delta_logloss.png)\n")
+
+        # -------- does the gain land where TabPFN v2 was weak? -------- #
+        base_cols = [b for b in BASELINES if b in set(pdf["method"])]
+        pa = pdf.pivot(index="dataset", columns="method", values="roc_auc")
+        if base_cols and "tabpfn_v2" in pa:
+            gap = (pa["tabpfn_v2"] - pa[base_cols].max(axis=1)).reindex(piv.index)
+            groups = {"TabPFN v2 behind best baseline": gap < -1e-4,
+                      "TabPFN v2 ahead": gap >= -1e-4}
+            if meta is not None:
+                ncat = meta.reindex(piv.index)["n_cat"].fillna(0)
+                groups["with categorical features"] = ncat > 0
+                groups["numerical only"] = ncat == 0
+            rows = []
+            for gname, mask in groups.items():
+                if mask.sum() == 0:
+                    continue
+                r = {"Subset": gname, "#datasets": int(mask.sum())}
+                for m in imp:
+                    if m != "tabpfn_v2":
+                        r[nice(m)] = (piv.loc[mask, m] - piv.loc[mask, "tabpfn_v2"]).mean()
+                rows.append(r)
+            sg = pd.DataFrame(rows)
+            sg.to_csv(os.path.join(a.out, "table_B_subgroups.csv"), index=False)
+            md += ["Mean ΔAUC vs. TabPFN v2 by subset:\n",
+                   sg.to_markdown(index=False, floatfmt="+.4f") + "\n"]
+            ours = "tabpfn_gbx_te" if "tabpfn_gbx_te" in piv else None
+            if ours:
+                y = piv[ours] - piv["tabpfn_v2"]
+                plot_scatter(gap.values, y.values, "AUC(TabPFN v2) − AUC(best baseline)",
+                             f"AUC({nice(ours)}) − AUC(TabPFN v2)",
+                             "Gain of TabPFN-GBX vs. weakness of TabPFN v2",
+                             os.path.join(a.out, "fig_B_gain_vs_weakness.png"),
+                             labels=list(piv.index))
+                md.append("![gain](fig_B_gain_vs_weakness.png)\n")
         if "weights" in df.columns:
             w = df[df["method"].str.startswith("ens_") & df["weights"].notna()]
             if len(w):
                 ww = pd.json_normalize(w["weights"]).assign(method=w["method"].values)
                 mw = ww.groupby("method").mean()
-                mw.to_csv(os.path.join(out, "table_B1_ensemble_weights.csv"))
-                md.append("Average ensemble weights:\n\n" + mw.to_markdown(floatfmt=".3f") + "\n")
+                mw.index = [nice(i) for i in mw.index]
+                mw.to_csv(os.path.join(a.out, "table_B_ensemble_weights.csv"))
+                md += ["Average ensemble weights (chosen on the inner validation split):\n",
+                       mw.to_markdown(floatfmt=".3f") + "\n"]
 
-
-def section_nano(nano_dir, out, md):
-    df = load_ok(os.path.join(nano_dir, "metrics.jsonl"))
-    if not len(df):
-        return
-    df.to_csv(os.path.join(out, "nano_all_rows.csv"), index=False)
-    if "family" not in df:
-        df["family"] = df["method"]
-    df["family"] = df["family"].fillna(df["method"])
-    # per (dataset, family, seed) -> mean over folds
-    g = df.groupby(["dataset", "family", "seed"])[["roc_auc", "accuracy", "log_loss"]] \
-        .mean().reset_index()
-    fams = sorted(g["family"].unique(), key=lambda m: (not m.startswith("nano"), m))
-    dsets = complete_datasets(g.rename(columns={"family": "method"}), fams)
-    g = g[g["dataset"].isin(dsets)]
-    # seed-level means over datasets, then mean +- std over seeds
-    seed_level = g.groupby(["family", "seed"])[["roc_auc", "accuracy", "log_loss"]].mean()
-    agg = seed_level.groupby("family").agg(["mean", "std"])
-    # ranks on seed-averaged per-dataset AUC
-    pdf = g.groupby(["dataset", "family"])["roc_auc"].mean().unstack()
-    ranks = pdf.rank(axis=1, ascending=False).mean()
-    nano_only = [f for f in fams if f.startswith("nano")]
-    nano_ranks = pdf[nano_only].rank(axis=1, ascending=False).mean() if nano_only else None
-    hist = {}
-    for p in glob.glob(os.path.join(nano_dir, "ckpt", "*_history.csv")):
-        tag = os.path.basename(p).replace("_history.csv", "")
-        v, s = tag.rsplit("_s", 1)
-        h = pd.read_csv(p)
-        hist.setdefault("nano_" + v, []).append(h)
-    rows = []
-    for f in fams:
-        r = dict(Method=nice(f), key=f,
-                 AUC=f"{agg.loc[f, ('roc_auc', 'mean')]:.4f} ± {np.nan_to_num(agg.loc[f, ('roc_auc', 'std')]):.4f}",
-                 Acc=f"{agg.loc[f, ('accuracy', 'mean')]:.4f} ± {np.nan_to_num(agg.loc[f, ('accuracy', 'std')]):.4f}",
-                 LogLoss=f"{agg.loc[f, ('log_loss', 'mean')]:.4f} ± {np.nan_to_num(agg.loc[f, ('log_loss', 'std')]):.4f}",
-                 MeanRank_all=ranks[f])
-        if nano_ranks is not None and f in nano_ranks:
-            r["MeanRank_nano"] = nano_ranks[f]
-        if f in hist:
-            fin = [h["val_loss"].iloc[-1] for h in hist[f]]
-            r["Prior val-loss"] = f"{np.mean(fin):.4f} ± {np.std(fin):.4f}"
-            r["Train time (s)"] = float(np.mean([h["time_s"].iloc[-1] for h in hist[f]]))
-            r["Non-finite steps"] = int(sum(h["nonfinite"].iloc[-1] for h in hist[f]))
-        rows.append(r)
-    tab = pd.DataFrame(rows).sort_values("MeanRank_all").reset_index(drop=True)
-    tab.to_csv(os.path.join(out, "table_B2_nano.csv"), index=False)
-    pdf.to_csv(os.path.join(out, "table_B2_per_dataset_auc.csv"))
-    md.append(f"## Part B-2 - nanoTabPFN architecture/optimizer ablation ({len(dsets)} datasets)\n")
-    md.append("Mean ± std over pre-training seeds. Every method sees the same context "
-              "subsample and feature subset.\n")
-    md.append(fmt(tab) + "\n")
-    # paired test of each nano variant vs. nano_base (seed-averaged per dataset AUC)
-    if "nano_base" in pdf:
-        from scipy.stats import wilcoxon
-        lines = []
-        for f in nano_only:
-            if f == "nano_base":
-                continue
-            d = pdf[f] - pdf["nano_base"]
-            try:
-                pv = wilcoxon(pdf[f], pdf["nano_base"]).pvalue
-            except ValueError:
-                pv = np.nan
-            lines.append(dict(Variant=nice(f), **{"ΔAUC vs base": d.mean(),
-                              "W/T/L": f"{(d > 1e-4).sum()}/{(d.abs() <= 1e-4).sum()}/{(d < -1e-4).sum()}",
-                              "p (Wilcoxon)": pv}))
-        if lines:
-            t2 = pd.DataFrame(lines)
-            t2.to_csv(os.path.join(out, "table_B2_vs_base.csv"), index=False)
-            md.append("Paired comparison with the nanoTabPFN baseline:\n\n" +
-                      t2.to_markdown(index=False, floatfmt=".4f") + "\n")
-    # figures
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    if hist:
-        fig, ax = plt.subplots(figsize=(6.5, 4))
-        for f, hs in sorted(hist.items()):
-            steps = hs[0]["step"].values
-            vals = np.mean([h["val_loss"].values[:len(steps)] for h in hs], axis=0)
-            ax.plot(steps, vals, label=nice(f))
-        ax.set_xlabel("pre-training step")
-        ax.set_ylabel("prior validation loss")
-        ax.set_title("Part B-2: pre-training curves (mean over seeds)")
-        ax.legend(fontsize=7)
-        fig.tight_layout()
-        fig.savefig(os.path.join(out, "fig_B2_curves.png"), dpi=150)
-        plt.close(fig)
-        md.append("![curves](fig_B2_curves.png)\n")
-    plot_bar(pdf.mean(), "Part B-2: mean ROC-AUC on real data", "ROC-AUC",
-             os.path.join(out, "fig_B2_auc.png"))
-    md.append("![auc](fig_B2_auc.png)\n")
-
-
-def main():
-    ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--bench", nargs="*", default=["results/benchmark"])
-    ap.add_argument("--nano", default="results/nano")
-    ap.add_argument("--out", default="results/report")
-    a = ap.parse_args()
-    os.makedirs(a.out, exist_ok=True)
-    md = ["# Results\n"]
-    section_bench([b for b in a.bench if os.path.isdir(b)], a.out, md)
-    if a.nano and os.path.isdir(a.nano):
-        section_nano(a.nano, a.out, md)
     with open(os.path.join(a.out, "report.md"), "w") as f:
         f.write("\n".join(md))
     print("\n".join(md))
