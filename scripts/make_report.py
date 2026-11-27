@@ -21,10 +21,11 @@ from tabdl.utils import read_jsonl, slug  # noqa: E402
 BASELINES = ["logreg", "knn", "rf", "xgb", "lgbm", "catboost"]
 REPRO_METHODS = BASELINES + ["tabpfn_v2"]
 EXISTING = ["tabpfn_v2", "catboost", "tabpfn_v2_ft", "ens_pfn_cat", "ens_ft_cat", "ens_phe"]
-OURS = ["tabpfn_te", "tabpfn_gbx", "tabpfn_gbx_te", "ens_gbx", "ens_gbx_phe", "ens_gbx_phe_ft"]
+OURS = ["tabpfn_te", "tabpfn_gbx", "tabpfn_gbx_te", "ens_gbx", "ens_gbx_phe", "ens_gbx_phe_ft",
+        "oofphe_pfn", "oofphe_pfn_ts", "oofphe_all", "oofphe_all_ts", "oofphe_safe"]
 PORTFOLIO = ["tabpfn_v2", "pfn_onehot", "pfn_ordinal", "pfn_kdi", "pfn_poly", "pfn_sharp",
              "pfn_avgsm", "pfn_wide", "tabpfn_gbx_te", "gbx_onehot"]
-FINAL = "ens_gbx_phe"
+FINAL = "oofphe_safe"
 NICE = {
     "logreg": "Logistic Regression", "knn": "kNN", "rf": "Random Forest",
     "xgb": "XGBoost", "lgbm": "LightGBM", "catboost": "CatBoost",
@@ -37,8 +38,13 @@ NICE = {
     "tabpfn_gbx_te": "TabPFN-GBX [ours]",
     "ens_gbx": "TabPFN-GBX-Ens [ours]",
     "ens_phe": "TabPFN v2-PHE (config ensemble) [existing idea]",
-    "ens_gbx_phe": "TabPFN-GBX-PHE [ours, final]",
-    "ens_gbx_phe_ft": "TabPFN-GBX-PHE + FT [ours, final+FT]",
+    "ens_gbx_phe": "TabPFN-GBX-PHE, holdout weights [ours v1]",
+    "ens_gbx_phe_ft": "TabPFN-GBX-PHE + FT, holdout weights [ours v1]",
+    "oofphe_pfn": "OOF-PHE: TabPFN configs [ours v2, ablation]",
+    "oofphe_pfn_ts": "OOF-PHE: TabPFN configs + TS [ours v2, ablation]",
+    "oofphe_all": "OOF-PHE: + CatBoost + GBX [ours v2, ablation]",
+    "oofphe_all_ts": "OOF-PHE-GBX + TS [ours v2, ablation]",
+    "oofphe_safe": "Safe OOF-PHE-GBX (anchored + gate) [ours v3, FINAL]",
     "pfn_onehot": "TabPFN v2 cfg: one-hot categoricals", "pfn_ordinal": "TabPFN v2 cfg: ordinal",
     "pfn_kdi": "TabPFN v2 cfg: KDI transform", "pfn_poly": "TabPFN v2 cfg: +polynomial",
     "pfn_sharp": "TabPFN v2 cfg: T=0.75", "pfn_avgsm": "TabPFN v2 cfg: avg logits",
@@ -82,6 +88,8 @@ def joint(pdf, methods, value="roc_auc"):
 
 def summary_table(pdf, methods, ref, times=None):
     piv_auc = joint(pdf, methods, "roc_auc")
+    piv_ll = joint(pdf, methods, "log_loss").reindex(piv_auc.index)
+    piv_acc = joint(pdf, methods, "accuracy").reindex(piv_auc.index)
     dsets = piv_auc.index
     sub = pdf[pdf["dataset"].isin(dsets) & pdf["method"].isin(methods)]
     ranks = piv_auc.rank(axis=1, ascending=False).mean()
@@ -96,20 +104,32 @@ def summary_table(pdf, methods, ref, times=None):
             r["ΔAUC vs ref"] = d.mean()
             r["W/T/L vs ref"] = (f"{int((d > 1e-4).sum())}/{int((d.abs() <= 1e-4).sum())}/"
                                  f"{int((d < -1e-4).sum())}")
-            try:
-                from scipy.stats import wilcoxon
-                r["p (Wilcoxon)"] = float(wilcoxon(piv_auc[m], piv_auc[ref]).pvalue) \
-                    if (d.abs() > 1e-12).any() else 1.0
-            except Exception:  # noqa: BLE001
-                r["p (Wilcoxon)"] = np.nan
+            dl = piv_ll[m] - piv_ll[ref]
+            r["W/T/L LogLoss"] = (f"{int((dl < -1e-4).sum())}/{int((dl.abs() <= 1e-4).sum())}/"
+                                  f"{int((dl > 1e-4).sum())}")
+            from scipy.stats import wilcoxon
+
+            def _p(a_, b_):
+                try:
+                    return float(wilcoxon(a_, b_).pvalue) if (np.abs(a_ - b_) > 1e-12).any() \
+                        else 1.0
+                except Exception:  # noqa: BLE001
+                    return np.nan
+            r["Worst ΔAUC"] = float(d.min())
+            r["#ΔAUC<-0.005"] = int((d < -0.005).sum())
+            r["p (Wilcoxon)"] = _p(piv_auc[m], piv_auc[ref])
+            r["p LogLoss"] = _p(piv_ll[m], piv_ll[ref])
+            r["p Acc"] = _p(piv_acc[m], piv_acc[ref])
         else:
             r["W/T/L vs ref"] = "(reference)"
+            r["W/T/L LogLoss"] = "(reference)"
         if times is not None and m in times.index:
             r["Time/fold (s)"] = times[m]
         rows.append(r)
     out = pd.DataFrame(rows).sort_values("MeanRank").reset_index(drop=True)
     order = ["Method", "key", "AUC", "Acc", "LogLoss", "MeanRank", "ΔAUC vs ref",
-             "W/T/L vs ref", "p (Wilcoxon)", "Time/fold (s)"]
+             "W/T/L vs ref", "p (Wilcoxon)", "W/T/L LogLoss", "p LogLoss", "p Acc",
+             "Worst ΔAUC", "#ΔAUC<-0.005", "Time/fold (s)"]
     return out[[c for c in order if c in out.columns]], piv_auc
 
 
@@ -326,6 +346,35 @@ def main():
                 md += ["Average ensemble weights (chosen on the inner validation split):\n",
                        mw.to_markdown(floatfmt=".3f") + "\n"]
 
+    if "info" in df.columns:
+        rows = df[(df["method"] == FINAL) & df["info"].notna()]
+        if len(rows) and "gate" in rows["info"].iloc[0]:
+            g = pd.DataFrame([dict(dataset=d, fold=k, **i["gate"]) for d, k, i in
+                              zip(rows["dataset"], rows["fold"], rows["info"])])
+            g.to_csv(os.path.join(a.out, "table_B_gate_decisions.csv"), index=False)
+            frac = g.groupby("dataset")["use_ensemble"].mean()
+            lines = [f"**Safe gate**: the ensemble replaced TabPFN v2 in "
+                     f"{g['use_ensemble'].mean():.0%} of the {len(g)} (dataset, fold) cases; "
+                     f"otherwise the original TabPFN v2 prediction was kept unchanged."]
+            pa_ = pdf.pivot(index="dataset", columns="method", values="roc_auc")
+            bcols = [b for b in BASELINES if b in pa_]
+            if bcols and "tabpfn_v2" in pa_:
+                gap_ = (pa_["tabpfn_v2"] - pa_[bcols].max(axis=1)).reindex(frac.index)
+                lines.append(f"Share of folds using the ensemble: "
+                             f"{frac[gap_ < -1e-4].mean():.0%} on datasets where TabPFN v2 "
+                             f"is behind the best baseline vs. {frac[gap_ >= -1e-4].mean():.0%} "
+                             f"where it is ahead.")
+            md += [" ".join(lines) + "\n"]
+        if len(rows):
+            W = pd.DataFrame([r["weights"]["safe" if "safe" in r["weights"] else "all"]
+                              for r in rows["info"]]).fillna(0).mean()
+            T = np.mean([r["temperature"].get("safe", r["temperature"]["all"])
+                         for r in rows["info"]])
+            W.index = [nice(i) for i in W.index]
+            W.to_csv(os.path.join(a.out, "table_B_oofphe_weights.csv"))
+            md += [f"{nice(FINAL)}: average member weights (selected on 5-fold OOF predictions); "
+                   f"mean fitted temperature T = {T:.3f}:\n",
+                   W.rename("weight").to_frame().to_markdown(floatfmt=".3f") + "\n"]
     with open(os.path.join(a.out, "report.md"), "w") as f:
         f.write("\n".join(md))
     print("\n".join(md))

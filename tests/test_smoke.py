@@ -53,6 +53,23 @@ def test_augmentation_helps_on_categorical_signal():
     assert aucs["logreg_gbx_te"] > aucs["logreg"] + 0.05, aucs
 
 
+def test_oofphe_variants():
+    X, y = _cat_problem(n=400)
+    m = make_model("oofphe_test", [0, 1], 0, 2, {"oof_folds": 3, "gbx_inner": 2})
+    m.fit(X[:300], y[:300])
+    V = m.predict_variants(X[300:])
+    assert set(V) == {"oofphe_pfn", "oofphe_pfn_ts", "oofphe_all", "oofphe_all_ts",
+                      "oofphe_safe"}
+    for p in V.values():
+        assert p.shape == (100, 2) and np.allclose(p.sum(1), 1)
+    info = m.info()
+    assert abs(sum(info["weights"]["all"].values()) - 1) < 1e-6 and not info["failed"]
+    assert "use_ensemble" in info["gate"]
+    if not info["gate"]["use_ensemble"]:          # fallback = unchanged anchor model
+        anchor = make_model("logreg", [0, 1], 0, 2).fit(X[:300], y[:300])
+        assert np.allclose(V["oofphe_safe"], anchor.predict_proba(X[300:]), atol=1e-6)
+
+
 def test_metrics_and_ensemble():
     rng = np.random.default_rng(0)
     y = rng.integers(0, 3, 200)

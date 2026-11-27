@@ -17,14 +17,24 @@ def _nll(y, p):
 
 
 def caruana_weights(val_probas: list[np.ndarray], y_val: np.ndarray, n_classes: int,
-                    n_iter: int = 25) -> np.ndarray:
+                    n_iter: int = 25, anchor: int | None = None,
+                    anchor_count: int = 0) -> np.ndarray:
+    """Greedy ensemble selection with replacement.
+
+    ``anchor``/``anchor_count``: start with ``anchor_count`` copies of member
+    ``anchor`` (e.g. the original TabPFN v2). This shrinks the weights towards the
+    anchor, so the ensemble only moves away from it when the data clearly say so.
+    """
     P = [fix_proba(p, n_classes) for p in val_probas]
     M = len(P)
     counts = np.zeros(M)
-    # start from the best single model
-    best = int(np.argmin([_nll(y_val, p) for p in P]))
-    counts[best] = 1
-    cur = P[best].copy()
+    if anchor is not None and anchor_count > 0:
+        counts[anchor] = anchor_count
+        cur = P[anchor].copy()
+    else:                                   # start from the best single model
+        best = int(np.argmin([_nll(y_val, p) for p in P]))
+        counts[best] = 1
+        cur = P[best].copy()
     for _ in range(n_iter - 1):
         k = counts.sum()
         scores = [_nll(y_val, (cur * k + P[m]) / (k + 1)) for m in range(M)]

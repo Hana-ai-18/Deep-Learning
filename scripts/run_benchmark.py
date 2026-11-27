@@ -28,7 +28,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 
 from tabdl.data import get_datasets, holdout_split, make_folds  # noqa: E402
 from tabdl.metrics import all_metrics, fix_proba  # noqa: E402
-from tabdl.models import has_cuda, make_model  # noqa: E402
+from tabdl.models import VARIANT_METHODS, has_cuda, make_model  # noqa: E402
 from tabdl.utils import append_jsonl, free_gpu, set_seed, slug  # noqa: E402
 
 
@@ -52,19 +52,18 @@ def parse():
     ap.add_argument("--ft_lr", type=float, default=1e-5)
     ap.add_argument("--gbx_folds", type=int, default=5, help="K of the OOF cross-fitting")
     ap.add_argument("--gbx_iterations", type=int, default=500, help="CatBoost trees (GBX)")
+    ap.add_argument("--oof_folds", type=int, default=5, help="K of OOF-PHE")
+    ap.add_argument("--gbx_inner", type=int, default=3, help="inner folds of nested GBX")
+    ap.add_argument("--cat_iterations", type=int, default=500, help="CatBoost trees in OOF-PHE")
+    ap.add_argument("--shard", type=int, default=0, help="run datasets with index %% n_shards == shard")
+    ap.add_argument("--n_shards", type=int, default=1)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--cache_dir", default=os.environ.get("OPENML_CACHE", "openml_cache"))
     ap.add_argument("--out", default="results/benchmark")
     return ap.parse_args()
 
 
-def fit_predict(method, Xtr, ytr, Xte, cat_idx, seed, n_classes, cfg):
-    model = make_model(method, cat_idx, seed, n_classes, cfg)
-    t0 = time.time()
-    model.fit(Xtr, ytr)
-    t1 = time.time()
-    p = model.predict_proba(Xte)
-    t2 = time.time()
+def _align(p, ytr, n_classes):
     # map model class order -> global labels (models only know classes seen in ytr)
     seen = np.unique(ytr)
     p = np.asarray(p)
@@ -72,9 +71,24 @@ def fit_predict(method, Xtr, ytr, Xte, cat_idx, seed, n_classes, cfg):
         full = np.zeros((p.shape[0], n_classes))
         full[:, seen] = p
         p = full
+    return fix_proba(p, n_classes)
+
+
+def fit_predict(method, Xtr, ytr, Xte, cat_idx, seed, n_classes, cfg):
+    """Return ({method_or_variant: proba}, fit_time, predict_time, info)."""
+    model = make_model(method, cat_idx, seed, n_classes, cfg)
+    t0 = time.time()
+    model.fit(Xtr, ytr)
+    t1 = time.time()
+    if hasattr(model, "predict_variants"):
+        out = {k: _align(v, ytr, n_classes) for k, v in model.predict_variants(Xte).items()}
+    else:
+        out = {method: _align(model.predict_proba(Xte), ytr, n_classes)}
+    t2 = time.time()
+    info = model.info() if hasattr(model, "info") else None
     del model
     free_gpu()
-    return fix_proba(p, n_classes), t1 - t0, t2 - t1
+    return out, t1 - t0, t2 - t1, info
 
 
 def main():
@@ -86,7 +100,8 @@ def main():
     methods = [m.strip() for m in a.methods.split(",") if m.strip()]
     cfg = dict(ckpt=a.ckpt, n_estimators=a.n_estimators, ft_time_limit=a.ft_time_limit,
                ft_epochs=a.ft_epochs, ft_lr=a.ft_lr, gbx_folds=a.gbx_folds,
-               gbx_iterations=a.gbx_iterations)
+               gbx_iterations=a.gbx_iterations, oof_folds=a.oof_folds, gbx_inner=a.gbx_inner,
+               cat_iterations=a.cat_iterations)
     print(f"CUDA available: {has_cuda()} | methods: {methods}")
 
     datasets = get_datasets(a.source, max_rows=a.max_rows, max_features=a.max_features,
@@ -100,6 +115,8 @@ def main():
 
     metrics_path = os.path.join(a.out, "metrics.jsonl")
     for di, ds in enumerate(datasets):
+        if di % a.n_shards != a.shard:
+            continue
         dname = slug(ds.name if ds.did is None else f"{ds.name}_{ds.did}")
         folds = make_folds(ds.y, a.n_folds, seed=a.seed)
         for k, (tr, te) in enumerate(folds):
@@ -107,32 +124,41 @@ def main():
             if a.val_preds:
                 itr, iva = holdout_split(ytr, a.val_frac, seed=a.seed + k)
             for m in methods:
-                fpath = os.path.join(a.out, "preds", f"{dname}__f{k}__{m}.npz")
+                outs_names = VARIANT_METHODS.get(m, [m])
+                fpath = os.path.join(a.out, "preds", f"{dname}__f{k}__{outs_names[-1]}.npz")
                 if os.path.exists(fpath):
                     continue
-                row = dict(dataset=dname, did=ds.did, n=int(ds.X.shape[0]),
-                           d=int(ds.X.shape[1]), n_classes=ds.n_classes, fold=k, method=m)
+                base = dict(dataset=dname, did=ds.did, n=int(ds.X.shape[0]),
+                            d=int(ds.X.shape[1]), n_classes=ds.n_classes, fold=k)
                 try:
                     seed = a.seed + 1000 * k
-                    p_te, tfit, tpred = fit_predict(m, Xtr, ytr, Xte, ds.cat_idx, seed,
-                                                    ds.n_classes, cfg)
-                    save = dict(p_test=p_te, y_test=yte)
-                    if a.val_preds:
-                        p_va, _, _ = fit_predict(m, Xtr[itr], ytr[itr], Xtr[iva], ds.cat_idx,
-                                                 seed, ds.n_classes, cfg)
-                        save.update(p_val=p_va, y_val=ytr[iva])
-                    np.savez_compressed(fpath, **save)
-                    row.update(all_metrics(yte, p_te, ds.n_classes), fit_time=tfit,
-                               predict_time=tpred, status="ok")
-                    print(f"[{di + 1}/{len(datasets)}] {dname} f{k} {m:14s} "
-                          f"AUC={row['roc_auc']:.4f} acc={row['accuracy']:.4f} "
-                          f"ll={row['log_loss']:.4f} t={tfit + tpred:.1f}s", flush=True)
+                    P, tfit, tpred, info = fit_predict(m, Xtr, ytr, Xte, ds.cat_idx, seed,
+                                                       ds.n_classes, cfg)
+                    P_val = None
+                    self_val = m in VARIANT_METHODS
+                    if a.val_preds and not self_val:
+                        P_val, _, _, _ = fit_predict(m, Xtr[itr], ytr[itr], Xtr[iva],
+                                                     ds.cat_idx, seed, ds.n_classes, cfg)
+                    for name in outs_names:            # marker file is written last
+                        save = dict(p_test=P[name], y_test=yte)
+                        if P_val is not None:
+                            save.update(p_val=P_val[name], y_val=ytr[iva])
+                        row = dict(base, method=name, fit_time=tfit, predict_time=tpred,
+                                   status="ok", **all_metrics(yte, P[name], ds.n_classes))
+                        if info is not None:
+                            row["info"] = info
+                        append_jsonl(metrics_path, row)
+                        np.savez_compressed(os.path.join(
+                            a.out, "preds", f"{dname}__f{k}__{name}.npz"), **save)
+                        print(f"[{di + 1}/{len(datasets)}] {dname} f{k} {name:14s} "
+                              f"AUC={row['roc_auc']:.4f} acc={row['accuracy']:.4f} "
+                              f"ll={row['log_loss']:.4f} t={tfit + tpred:.1f}s", flush=True)
                 except Exception as e:  # noqa: BLE001
-                    row.update(status="error", error=f"{type(e).__name__}: {e}")
+                    row = dict(base, method=m, status="error", error=f"{type(e).__name__}: {e}")
                     print(f"[ERR] {dname} f{k} {m}: {e}", flush=True)
                     traceback.print_exc(limit=2)
                     free_gpu()
-                append_jsonl(metrics_path, row)
+                    append_jsonl(metrics_path, row)
     print("done ->", metrics_path)
 
 

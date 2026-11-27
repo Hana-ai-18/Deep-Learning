@@ -1,4 +1,4 @@
-# TabPFN v2 — Reproduce & cải tiến: **TabPFN-GBX-PHE** (đồ án môn Deep Learning)
+# TabPFN v2 — Reproduce & cải tiến: **Safe OOF-PHE-GBX** (đồ án môn Deep Learning)
 
 * **Paper gốc:** Hollmann et al., *Accurate predictions on small data with a tabular foundation
   model*, **Nature 637, 2025** (TabPFN v2).
@@ -46,6 +46,30 @@ cross-fitting K-fold trên tập train:
 Chi phí: K lần fit CatBoost trên CPU và khoảng 10 lượt suy luận TabPFN (chậm hơn bản gốc vài lần);
 không cần gradient.
 
+## 1b. Bản chính: **Safe OOF-PHE-GBX**
+
+Kết quả v1 (TabPFN-GBX-PHE, 33 dataset) có hạng trung bình, log-loss và accuracy tốt nhất nhưng
+chỉ hơn TabPFN v2 +0.0004 AUC (p = 0.11). Chẩn đoán: trọng số ensemble được chọn trên một split
+validation 20 % (thường dưới 200 dòng) nên nhiễu; TabPFN v2 mặc định chỉ nhận trọng số 0.01.
+
+v2 sửa phần **ước lượng** ensemble:
+1. Dự đoán **out-of-fold 5-fold trên 100 % dữ liệu train** cho mọi thành viên. Với TabPFN chỉ tốn
+   thêm 5 lượt forward, không cần train.
+2. Dự đoán test của TabPFN dùng **toàn bộ fold train làm ngữ cảnh**; CatBoost dùng **bagging** 5 mô
+   hình fold.
+3. **Caruana ensemble selection trên OOF** rồi **temperature scaling** fit trên OOF.
+4. Thành viên: 7 cấu hình TabPFN v2 + CatBoost + TabPFN-GBX (cross-fit lồng nhau, không rò rỉ).
+
+5. **Giữ điểm mạnh của bản gốc ("do no harm"):** chọn trọng số **neo vào TabPFN v2** (khởi đầu với
+   10 bản sao, co về bản gốc) và **cổng kiểm định**: cross-validate chính quy trình chọn ensemble
+   trên các dòng OOF, so log-loss từng dòng với TabPFN v2; chỉ dùng ensemble khi cải thiện dương
+   và có ý nghĩa (t-test một phía, z > 1.645), nếu không thì **giữ nguyên dự đoán TabPFN v2**.
+   Phần cải tiến chỉ được dùng ở nơi bản gốc yếu.
+
+Một lần fit cho 5 biến thể ablation: `oofphe_pfn`, `oofphe_pfn_ts`, `oofphe_all`, `oofphe_all_ts`,
+`oofphe_safe` (bản chính). Báo cáo kiểm định Wilcoxon cho AUC, log-loss và accuracy, mức thua tệ
+nhất so với bản gốc, và tỉ lệ cổng chọn ensemble theo nhóm dataset.
+
 ## 2. Thiết kế thực nghiệm
 
 * **Dữ liệu:** OpenML-CC18 (suite 99), lọc ≤ 3000 dòng, ≤ 100 đặc trưng, ≤ 10 lớp, mỗi lớp
@@ -70,7 +94,10 @@ không cần gradient.
 2. Kaggle: **Accelerator = GPU T4 x2**, **Internet = On**.
 3. **Session 1:** `notebooks/01_reproduce_tabpfn_v2.ipynb`. Sửa `REPO_URL`, chạy hết, tải
    `session1_results.zip`.
-4. **Session 2:** `notebooks/02_improve_tabpfn_gbx_phe.ipynb`. Upload `session1_results.zip` thành
+4. **Session 2 (bản chính v2):** `notebooks/03_improve_oofphe.ipynb`. Gắn `final_results.zip` của
+   lần chạy Notebook 2 (hoặc `session1_results.zip`) làm Kaggle Dataset, sửa `REPO_URL`, chạy hết,
+   tải `final_results_v2.zip`. (`02_improve_tabpfn_gbx_phe.ipynb` là bản v1, giữ để tham khảo.)
+5. Bản v1 cũ (`02_improve_tabpfn_gbx_phe.ipynb`): upload `session1_results.zip` thành
    Kaggle Dataset, gắn vào notebook, sửa `REPO_URL`, chạy hết, tải `final_results.zip`.
 
 Mọi script chạy tiếp được: chạy lại cell sẽ bỏ qua phần đã xong.
@@ -78,7 +105,8 @@ Mọi script chạy tiếp được: chạy lại cell sẽ bỏ qua phần đã
 | Bước | Thời gian ước tính trên Kaggle |
 |---|---|
 | Notebook 1 (Phần A) | ~1–1,5 giờ |
-| Notebook 2: GBX + portfolio (GPU 0) song song fine-tune baseline (GPU 1) | ~3–4 giờ |
+| Notebook 2 (v1): GBX + portfolio (GPU 0) song song fine-tune baseline (GPU 1) | ~3–4 giờ |
+| Notebook 3 (v2): OOF-PHE-GBX, 33 dataset chia đôi cho 2 GPU | ~2,5–3,5 giờ |
 | Ensemble + báo cáo | vài phút |
 
 Giảm thời gian: `FT_TIME = 30` hoặc `GBX_FOLDS = 4` trong Notebook 2, hoặc bỏ `pfn_wide` khỏi danh sách.
@@ -87,7 +115,10 @@ Giảm thời gian: `FT_TIME = 30` hoặc `GBX_FOLDS = 4` trong Notebook 2, ho�
 ```
 tabpfn-dl-project/
 ├── notebooks/01_reproduce_tabpfn_v2.ipynb   # Session 1
-├── notebooks/02_improve_tabpfn_gbx_phe.ipynb  # Session 2
+├── notebooks/02_improve_tabpfn_gbx_phe.ipynb  # v1 (tham khảo)
+├── notebooks/03_improve_oofphe.ipynb          # Session 2, bản chính v2
+├── src/tabdl/oofstack.py      # OOF-PHE-GBX
+├── scripts/prefetch.py        # tải trước dataset + checkpoint trước khi chạy song song
 ├── scripts/run_benchmark.py   # chạy mọi phương pháp, lưu metric + dự đoán, resumable
 ├── scripts/run_ensembles.py   # ensemble selection từ dự đoán đã lưu
 ├── scripts/make_report.py     # bảng Markdown/CSV + hình PNG

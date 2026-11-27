@@ -214,8 +214,26 @@ PFN_PORTFOLIO = ["pfn_onehot", "pfn_ordinal", "pfn_kdi", "pfn_poly", "pfn_sharp"
                  "pfn_avgsm", "pfn_wide"]
 
 
+# methods whose single fit yields several result variants (ablations)
+VARIANT_METHODS = {
+    "oofphe": ["oofphe_pfn", "oofphe_pfn_ts", "oofphe_all", "oofphe_all_ts", "oofphe_safe"],
+    "oofphe_test": ["oofphe_pfn", "oofphe_pfn_ts", "oofphe_all", "oofphe_all_ts",
+                    "oofphe_safe"],
+}
+
+
 def make_model(name: str, cat_idx, seed: int, n_classes: int, cfg: dict | None = None):
     cfg = cfg or {}
+    if name in ("oofphe", "oofphe_test"):
+        from .oofstack import OOFStackedPHE
+        kw = dict(n_folds=cfg.get("oof_folds", 5), gbx_inner_folds=cfg.get("gbx_inner", 3),
+                  gbx_iterations=cfg.get("gbx_iterations", 300),
+                  cat_iterations=cfg.get("cat_iterations", 500))
+        if name == "oofphe_test":           # CPU stand-in: baselines instead of TabPFN
+            cfg = {**cfg, "gbx_model": "lgbm"}
+            kw["pfn_members"] = ["tabpfn_v2", "knn", "rf"]
+            cfg = {**cfg, "anchor_as": "logreg"}
+        return OOFStackedPHE(cat_idx, n_classes, seed=seed, cfg=cfg, **kw)
     if name in PFN_PORTFOLIO:
         kw = dict(n_estimators=cfg.get("n_estimators", 8), ckpt=cfg.get("ckpt", "original"))
         kw.update(pfn_portfolio_config(name))
